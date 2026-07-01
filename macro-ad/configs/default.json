@@ -1,0 +1,61 @@
+{
+    "seq_len": 96,
+    "patch_len": 6,
+    "ms_kernels": [16, 8, 4, 2],
+    "ms_use_detail": true,
+
+    "d_model": 128,
+    "d_ff": null,
+    "d_state": 16,
+    "d_conv": 4,
+    "expand": 2,
+
+    "e_layers": 2,
+    "d_layers": 2,
+    "m_layers": 2,
+    "n_heads": 4,
+
+    "attn_dropout": 0.1,
+    "proj_dropout": 0.1,
+    "ff_dropout": 0.1,
+    "activation": "gelu",
+
+    "n_query": 5,
+    "query_len": 5,
+    "bank_size": 32,
+    "topk": 10,
+    "decay": 0.95,
+    "epsilon": 1e-5,
+
+    "use_adain": false,
+    "adain_freq_bins": 16,
+    "adain_hidden_dim": 64,
+    "use_revin": false,
+
+    "use_mamba2": false,
+    "mamba2_n_heads": 4,
+
+    "use_gnn": true,
+    "tgat_n_hops": 2,
+
+    "use_hier_memory": false,
+    "hier_short_size": 16,
+    "hier_short_decay": 0.8,
+    "hier_medium_size": 48,
+    "hier_medium_decay": 0.95,
+    "hier_long_size": 96,
+    "hier_long_decay": 0.995,
+
+    "use_dual_decoder": false,
+    "pred_horizon": 12,
+    "pred_weight": 0.3,
+
+    "use_dist_scoring": false,
+    "learnable_pe": false,
+
+    "train_epochs": 100,
+    "batch_size": 32,
+    "learning_rate": 2e-4,
+    "patience": 15,
+    "grad_clip": 1.0
+}
