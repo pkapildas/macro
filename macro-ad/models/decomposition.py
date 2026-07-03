@@ -43,15 +43,18 @@ class LearnableWaveletDecomposition(nn.Module):
             pad_size = kernel - 1
             padded = F.pad(x, (0, pad_size), mode="replicate")
 
+            # Low-pass: normalized
             filt = self.low_pass_filters[idx]
-            filt_norm = filt / (filt.sum() + 1e-8)
+            filt_norm = filt / (filt.abs().sum() + 1e-8)
             filt_expanded = filt_norm.expand(C, 1, -1)
             approx = F.conv1d(padded, filt_expanded, stride=kernel, groups=C)
             approx_list.append(approx.permute(0, 2, 1))
 
             if self.use_detail:
+                # High-pass: also normalized to prevent gradient explosion
                 filt_h = self.high_pass_filters[idx]
-                filt_h_expanded = filt_h.expand(C, 1, -1)
+                filt_h_norm = filt_h / (filt_h.abs().sum() + 1e-8)
+                filt_h_expanded = filt_h_norm.expand(C, 1, -1)
                 detail = F.conv1d(padded, filt_h_expanded, stride=kernel, groups=C)
                 detail_list.append(detail.permute(0, 2, 1))
 

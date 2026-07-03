@@ -1,6 +1,6 @@
 # MacroAD — Multi-scale Anomaly Detection with Cross-scale Reconstruction and Adaptive Decomposition
 
-A modularized, clean implementation of the Mamba based Anomaly Detection  architecture for time series anomaly detection.
+A modularized, clean implementation of the CrossAD-v2 architecture for time series anomaly detection.
 
 ## Architecture Overview
 

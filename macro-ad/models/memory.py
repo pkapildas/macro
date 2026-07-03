@@ -23,13 +23,18 @@ class Router(nn.Module):
 
     def forward(self, x, state=None):
         bs, t, c = x.shape
+        device = x.device
         x_freq = torch.fft.rfft(x, dim=1, n=t)
         _, indices = torch.topk(x_freq.abs(), self.k, dim=1)
-        mesh_a, mesh_b = torch.meshgrid(torch.arange(x_freq.size(0)), torch.arange(x_freq.size(2)), indexing="ij")
+        mesh_a, mesh_b = torch.meshgrid(
+            torch.arange(x_freq.size(0), device=device),
+            torch.arange(x_freq.size(2), device=device),
+            indexing="ij"
+        )
         index_tuple = (mesh_a.unsqueeze(1), indices, mesh_b.unsqueeze(1))
         mask = torch.zeros_like(x_freq, dtype=torch.bool)
         mask[index_tuple] = True
-        x_freq[~mask] = torch.tensor(0.0+0j, device=x_freq.device)
+        x_freq = x_freq.masked_fill(~mask, 0.0)
         x = torch.fft.irfft(x_freq, dim=1, n=t)
 
         logits = self.fc(x)
@@ -38,7 +43,13 @@ class Router(nn.Module):
             state_flat = state.reshape(bs, -1)
             logits = logits + self.state_proj(state_flat)
 
-        return F.gumbel_softmax(logits, tau=1, hard=True)
+        if self.training:
+            return F.gumbel_softmax(logits, tau=1, hard=True)
+        else:
+            idx = logits.argmax(dim=-1)
+            one_hot = torch.zeros_like(logits)
+            one_hot.scatter_(-1, idx.unsqueeze(-1), 1.0)
+            return one_hot
 
 
 class MemoryTier(nn.Module):
@@ -51,21 +62,33 @@ class MemoryTier(nn.Module):
         self.decay = decay
         self.epsilon = epsilon
 
-        self.register_buffer("memory", torch.randn(tier_size, query_len, d_model))
+        self.register_buffer("memory", torch.randn(tier_size, query_len, d_model) * 0.02)
         self.register_buffer("ema_count", torch.ones(tier_size))
         self.register_buffer("ema_dw", torch.zeros(tier_size, query_len, d_model))
 
-    def update(self, q):
+    def update(self, q, use_straight_through=True):
+        """
+        q: [B, query_len, d_model]
+        Returns: (distances [B], context [tier_size, query_len, d_model])
+        Context shape is ALWAYS [tier_size, query_len, d_model] regardless of batch size.
+
+        use_straight_through: if True, use memory directly (for training/validation loss).
+                              if False, use input-dependent weighted readout (for anomaly scoring).
+        """
         _, q_len, d = q.shape
         q_flat = q.reshape(-1, q_len * d)
         g_flat = self.memory.reshape(-1, q_len * d)
 
+        # Clamp pre-softmax scores to prevent overflow
         scores = torch.matmul(q_flat, g_flat.t()) / (g_flat.shape[-1] ** 0.5)
+        scores = torch.clamp(scores, min=-30.0, max=30.0)
         encodings = F.softmax(scores, dim=-1)
 
+        # q_context: what the memory returns for each input query
         q_context = torch.einsum("bn,nqd->bqd", encodings, self.memory)
-        q_hat = torch.einsum("bn,bqd->nqd", encodings, q)
-        query_latent_distances = torch.mean(F.mse_loss(q_context.detach(), q, reduction="none"), dim=(1, 2))
+        query_latent_distances = torch.mean(
+            F.mse_loss(q_context.detach(), q, reduction="none"), dim=(1, 2)
+        )
 
         if self.training:
             with torch.no_grad():
@@ -73,11 +96,26 @@ class MemoryTier(nn.Module):
                 self.ema_count = self.decay * self.ema_count + (1 - self.decay) * torch.sum(encodings, dim=0)
                 n = torch.sum(self.ema_count)
                 self.ema_count = (self.ema_count + self.epsilon) / (n + N * self.epsilon) * n
+                self.ema_count = torch.clamp(self.ema_count, min=self.epsilon)
                 dw = torch.einsum("bn,bqd->nqd", encodings, q)
                 self.ema_dw = self.decay * self.ema_dw + (1 - self.decay) * dw
                 self.memory = self.ema_dw / self.ema_count.unsqueeze(-1).unsqueeze(-1)
+                self.memory = torch.clamp(self.memory, min=-5.0, max=5.0)
 
-        return query_latent_distances, q_hat
+        if use_straight_through:
+            # Straight-through: context = memory (with gradient path during training)
+            q_hat = torch.einsum("bn,bqd->nqd", encodings, q)
+            context = q_hat + self.memory.detach() - q_hat.detach()
+        else:
+            # Input-dependent: per-query weighted readout reshaped to bank shape
+            # Use activation pattern to produce per-slot context
+            activation = encodings.mean(dim=0)  # [N] avg activation per slot
+            activation = (activation / (activation.max() + 1e-8)).unsqueeze(-1).unsqueeze(-1)
+            # Blend: highly activated slots get more input influence
+            q_mean = q_context.mean(dim=0, keepdim=True).expand_as(self.memory)
+            context = (1 - activation) * self.memory + activation * q_mean
+
+        return query_latent_distances, context
 
 
 class HierarchicalMemory(nn.Module):
@@ -102,32 +140,39 @@ class HierarchicalMemory(nn.Module):
         self.tier_proj_long = nn.Linear(d_model, d_model)
 
     def update_context(self, q):
-        dist_s, q_hat_s = self.short_term.update(q)
-        dist_m, q_hat_m = self.medium_term.update(q)
-        dist_l, q_hat_l = self.long_term.update(q)
+        dist_s, ctx_s_raw = self.short_term.update(q)
+        dist_m, ctx_m_raw = self.medium_term.update(q)
+        dist_l, ctx_l_raw = self.long_term.update(q)
 
         query_latent_distances = 0.5 * dist_s + 0.3 * dist_m + 0.2 * dist_l
 
-        ctx_s = self.tier_proj_short(q_hat_s + self.short_term.memory.detach() - q_hat_s.detach())
-        ctx_m = self.tier_proj_medium(q_hat_m + self.medium_term.memory.detach() - q_hat_m.detach())
-        ctx_l = self.tier_proj_long(q_hat_l + self.long_term.memory.detach() - q_hat_l.detach())
+        ctx_s = self.tier_proj_short(ctx_s_raw)
+        ctx_m = self.tier_proj_medium(ctx_m_raw)
+        ctx_l = self.tier_proj_long(ctx_l_raw)
 
+        # Per-sample gate weights
         q_pooled = q.mean(dim=1)
-        tier_weights = self.tier_gate(q_pooled)
-        w_s, w_m, w_l = tier_weights[:, 0].mean(), tier_weights[:, 1].mean(), tier_weights[:, 2].mean()
+        tier_weights = self.tier_gate(q_pooled)  # [B, 3]
+        w_s = tier_weights[:, 0].mean()
+        w_m = tier_weights[:, 1].mean()
+        w_l = tier_weights[:, 2].mean()
 
         context = torch.cat([
-            (ctx_s * w_s).view(-1, self.d_model),
-            (ctx_m * w_m).view(-1, self.d_model),
-            (ctx_l * w_l).view(-1, self.d_model),
+            ctx_s.view(-1, self.d_model) * w_s,
+            ctx_m.view(-1, self.d_model) * w_m,
+            ctx_l.view(-1, self.d_model) * w_l,
         ], dim=0)
         return query_latent_distances, context
 
-    def concat_context(self):
+    def get_context(self):
         ctx_s = self.tier_proj_short(self.short_term.memory)
         ctx_m = self.tier_proj_medium(self.medium_term.memory)
         ctx_l = self.tier_proj_long(self.long_term.memory)
-        return torch.cat([ctx_s.view(-1, self.d_model), ctx_m.view(-1, self.d_model), ctx_l.view(-1, self.d_model)], dim=0)
+        return torch.cat([
+            ctx_s.view(-1, self.d_model),
+            ctx_m.view(-1, self.d_model),
+            ctx_l.view(-1, self.d_model)
+        ], dim=0)
 
 
 class Extractor(nn.Module):
@@ -138,6 +183,7 @@ class Extractor(nn.Module):
         super().__init__()
         self.d_model = d_model
         self.query_len = query_len
+        self.bank_size = bank_size
         self.use_hierarchical = use_hierarchical
 
         d_ff = d_ff or 4 * d_model
@@ -151,22 +197,27 @@ class Extractor(nn.Module):
         else:
             self.memory = MemoryTier(bank_size, query_len, d_model, decay, epsilon)
 
-    def forward(self, q, local_repr):
+    def forward(self, q, local_repr, scoring_mode=False):
         for layer in self.layers:
             q = layer(q, local_repr)
 
         if self.use_hierarchical:
             distances, context = self.memory.update_context(q)
         else:
-            distances, q_hat = self.memory.update(q)
-            context = (q_hat + self.memory.memory.detach() - q_hat.detach()).view(-1, self.d_model)
+            distances, context = self.memory.update(q, use_straight_through=not scoring_mode)
+            # context is [bank_size, query_len, d_model] — flatten to [bank_size*query_len, d_model]
+            context = context.view(-1, self.d_model)
 
         return distances, context
 
-    def get_context_for_inference(self):
+    def get_context_size(self):
+        """Returns the fixed context sequence length."""
         if self.use_hierarchical:
-            return self.memory.concat_context()
-        return self.memory.memory.view(-1, self.d_model)
+            total = (self.memory.short_term.tier_size +
+                     self.memory.medium_term.tier_size +
+                     self.memory.long_term.tier_size)
+            return total * self.query_len
+        return self.bank_size * self.query_len
 
 
 class ExtractorLayer(nn.Module):
@@ -198,8 +249,8 @@ class ContextNet(nn.Module):
         self.querys = querys
         self.extractor = extractor
 
-    def forward(self, x_enc, local_repr, state=None):
+    def forward(self, x_enc, local_repr, state=None, scoring_mode=False):
         q_indices = self.router(x_enc, state=state)
         q = torch.einsum('bn,nqd->bqd', q_indices, self.querys)
-        distances, context = self.extractor(q, local_repr)
+        distances, context = self.extractor(q, local_repr, scoring_mode=scoring_mode)
         return distances, context

@@ -13,7 +13,6 @@ from .encoder import MambaEncoder
 from .decoder import MambaDecoder
 from .graph import TemporalGraphAttention
 from .memory import Router, Extractor, ContextNet
-from .scoring import ScaleAttentionFusion, DistributionAwareScoring
 
 
 class MacroAD(nn.Module):
@@ -21,9 +20,9 @@ class MacroAD(nn.Module):
     MacroAD: Modular architecture for time series anomaly detection.
 
     Pipeline:
-        Input → Normalization → Multi-Scale Decomposition → Patch Embedding
-        → Mamba Encoder → Graph Attention → Context Memory → Mamba Decoder
-        → Anomaly Scoring → Output
+        Input -> Normalization -> Multi-Scale Decomposition -> Patch Embedding
+        -> Mamba Encoder -> Graph Attention -> Context Memory -> Mamba Decoder
+        -> Anomaly Scoring -> Output
     """
     def __init__(self, configs):
         super().__init__()
@@ -54,11 +53,23 @@ class MacroAD(nn.Module):
         )
         self.ms_t_lens = self.decomposition.get_output_lengths(seq_len)
 
-        # --- Stage 3: Patch Embedding ---
-        self.patch_embedding = PatchEmbedding(d_model, patch_len)
+        # --- Stage 3: Patch Embedding (per-scale) ---
+        self.patch_embeddings = nn.ModuleList([
+            PatchEmbedding(d_model, patch_len) for _ in range(self.n_scales)
+        ])
         self.pos_embedding = PositionalEmbedding(d_model, learnable=getattr(configs, 'learnable_pe', False))
         if getattr(configs, 'ms_use_detail', True):
             self.detail_proj = nn.Linear(d_model, d_model)
+
+        # Scale embeddings — distinguish tokens from different temporal resolutions
+        self.scale_embeddings = nn.Parameter(torch.randn(self.n_scales, 1, d_model) * 0.02)
+
+        # Compute total number of patches across all scales
+        self._n_patches_per_scale = []
+        for i, t_len in enumerate(self.ms_t_lens[:-1]):
+            n_patches = (t_len + patch_len - 1) // patch_len
+            self._n_patches_per_scale.append(n_patches)
+        self._total_patches = sum(self._n_patches_per_scale)
 
         # --- Stage 4: Encoder ---
         self.encoder = MambaEncoder(
@@ -117,11 +128,16 @@ class MacroAD(nn.Module):
                 topk=configs.topk,
                 d_state_input=d_state_input
             ),
-            querys=nn.Parameter(torch.randn(configs.n_query, configs.query_len, d_model)),
+            querys=nn.Parameter(torch.randn(configs.n_query, configs.query_len, d_model) * 0.02),
             extractor=extractor
         )
 
+        # Normalize context before feeding to decoder cross-attention
+        self.context_norm = nn.LayerNorm(d_model)
+
         # --- Stage 7: Decoder ---
+        # Output projection maps from d_model to patch_len per token,
+        # then we reconstruct exactly _total_patches * patch_len points
         self.decoder = MambaDecoder(
             d_model=d_model,
             n_layers=configs.d_layers,
@@ -132,11 +148,12 @@ class MacroAD(nn.Module):
             patch_len=patch_len
         )
 
-        # --- Stage 8: Scoring ---
-        self.scale_fusion = ScaleAttentionFusion(n_scales=self.n_scales)
-        self.use_dist_scoring = getattr(configs, 'use_dist_scoring', False)
-        if self.use_dist_scoring:
-            self.dist_scorer = DistributionAwareScoring(seq_len)
+        # Learned upsampling to handle any mismatch between decoder output and seq_len
+        dec_output_len = self._total_patches * patch_len
+        if dec_output_len != seq_len:
+            self.upsample = nn.Linear(dec_output_len, seq_len)
+        else:
+            self.upsample = None
 
         # --- Dual-Path Decoder ---
         self.use_dual_decoder = getattr(configs, 'use_dual_decoder', False)
@@ -153,7 +170,7 @@ class MacroAD(nn.Module):
             return self.normalizer(x, 'denorm')
         return x
 
-    def _forward(self, x_enc):
+    def _forward(self, x_enc, scoring_mode=False):
         bs, t, c = x_enc.shape
 
         # Normalize
@@ -174,19 +191,23 @@ class MacroAD(nn.Module):
         # Ground truth: full input at original resolution
         ms_gt = x_enc.reshape(bs, c, -1).permute(0, 2, 1)  # [bs, t, c]
 
-        # Patch embedding
+        # Per-scale patch embedding with scale tokens
+        embedded_scales = []
         for i in range(self.n_scales):
             approx_i = approx_list[i].permute(0, 2, 1)  # [B*C, 1, T_i]
-            approx_list[i] = self.patch_embedding(approx_i)
+            emb = self.patch_embeddings[i](approx_i)
 
-        # Fuse detail coefficients
-        if detail_list is not None and hasattr(self, 'detail_proj'):
-            for i in range(self.n_scales):
+            # Fuse detail coefficients
+            if detail_list is not None and hasattr(self, 'detail_proj'):
                 detail_i = detail_list[i].permute(0, 2, 1)
-                detail_emb = self.patch_embedding(detail_i)
-                approx_list[i] = approx_list[i] + self.detail_proj(detail_emb)
+                detail_emb = self.patch_embeddings[i](detail_i)
+                emb = emb + self.detail_proj(detail_emb)
 
-        ms_x_enc = torch.cat(approx_list, dim=1)
+            # Add scale embedding
+            emb = emb + self.scale_embeddings[i]
+            embedded_scales.append(emb)
+
+        ms_x_enc = torch.cat(embedded_scales, dim=1)
 
         # Positional encoding
         pos_emb = self.pos_embedding(ms_x_enc.shape[1])
@@ -201,21 +222,22 @@ class MacroAD(nn.Module):
             ms_x_enc = self.graph_attn(ms_x_enc, bs, c)
 
         # Context memory
-        if self.training:
-            distances, context = self.context_net(router_input, ms_x_enc, state=last_state)
-            context = context.unsqueeze(0).expand(bs * c, -1, -1)
-            distances = distances.reshape(bs, c, 1).permute(0, 2, 1)
-        else:
-            distances = torch.zeros(bs, 1, c, device=x_enc.device)
-            context = self.context_net.extractor.get_context_for_inference()
-            context = context.unsqueeze(0).expand(bs * c, -1, -1)
+        distances, context = self.context_net(router_input, ms_x_enc, state=last_state, scoring_mode=scoring_mode)
+        # context is [context_len, d_model] — fixed size regardless of batch
+        context = self.context_norm(context)
+        context = context.unsqueeze(0).expand(bs * c, -1, -1)
+        distances = distances.reshape(bs, c, 1).permute(0, 2, 1)
 
         # Decoder
         ms_x_dec = self.decoder(ms_x_enc, context)
-        ms_x_dec = ms_x_dec.reshape(bs * c, -1, 1)  # [B*C, dec_len, 1]
-        ms_x_dec = ms_x_dec.permute(0, 2, 1)  # [B*C, 1, dec_len]
-        ms_x_dec = F.interpolate(ms_x_dec, size=t, mode='linear', align_corners=False)  # [B*C, 1, t]
-        ms_x_dec = ms_x_dec.permute(0, 2, 1)  # [B*C, t, 1]
+        # ms_x_dec: [B*C, total_patches * patch_len]  (from Flatten in decoder projection)
+        ms_x_dec = ms_x_dec.unsqueeze(-1)  # [B*C, dec_len, 1]
+
+        # Learned upsampling if decoder output != seq_len
+        if self.upsample is not None:
+            ms_x_dec = ms_x_dec.squeeze(-1)  # [B*C, dec_len]
+            ms_x_dec = self.upsample(ms_x_dec)  # [B*C, t]
+            ms_x_dec = ms_x_dec.unsqueeze(-1)  # [B*C, t, 1]
         ms_x_dec = ms_x_dec.reshape(bs, c, t).permute(0, 2, 1)  # [bs, t, c]
 
         # Denormalize
@@ -243,13 +265,7 @@ class MacroAD(nn.Module):
         return loss, torch.mean(distances), ms_x_dec, ms_gt
 
     def infer(self, x_enc):
-        """Inference: returns (anomaly_scores [B, T, C], query_distances)."""
-        ms_gt, ms_x_dec, distances = self._forward(x_enc)
-
-        # Scoring
-        if self.use_dist_scoring:
-            scores = self.dist_scorer(ms_x_dec, ms_gt)
-        else:
-            scores = F.mse_loss(ms_x_dec, ms_gt, reduction="none")
-
+        """Inference: returns (anomaly_scores [B, T, C], query_distances [B, 1, C])."""
+        ms_gt, ms_x_dec, distances = self._forward(x_enc, scoring_mode=False)
+        scores = F.mse_loss(ms_x_dec, ms_gt, reduction="none")
         return scores, distances

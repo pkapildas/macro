@@ -1,0 +1,10 @@
+ Here's what to run on RunPod:
+
+  Full sweep (all 7 datasets, GPU config):
+  cd macro-ad && python sweep.py --root_path ../dataset --config configs/gpu_sweep.json --gpu cuda
+
+  Single dataset test:
+  cd macro-ad && python run.py --config configs/gpu_sweep.json --data MSL --root_path ../dataset --mode train_test --gpu cuda && python evaluate.py --data MSL --root_path ../dataset
+
+  Conservative sweep (default config, just GPU acceleration):
+  cd macro-ad && python sweep.py --root_path ../dataset --config configs/default.json --gpu cuda

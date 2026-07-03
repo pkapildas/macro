@@ -1,7 +1,7 @@
 """
 Encoder modules for MacroAD.
-- MambaEncoder: Original Mamba-1 sequential scan (stable)
-- Mamba2Encoder: Multi-head Mamba with per-head B/C/A (requires CUDA)
+- MambaBlock: Selective State Space Model with optimized parallel scan
+- Mamba2Block: Multi-head variant
 """
 import torch
 import torch.nn as nn
@@ -9,8 +9,62 @@ import torch.nn.functional as F
 import math
 
 
+def parallel_scan(dA, dB_x):
+    """
+    Parallel associative scan for SSM recurrence.
+    dA: [B, L, D, N] — discretized state matrix
+    dB_x: [B, L, D, N] — input contribution (dB * x)
+    Returns: hidden states [B, L, D, N]
+    """
+    B, L, D, N = dA.shape
+
+    if L <= 32:
+        h = torch.zeros(B, D, N, device=dA.device, dtype=dA.dtype)
+        hs = []
+        for t in range(L):
+            h = dA[:, t] * h + dB_x[:, t]
+            h = torch.clamp(h, min=-10.0, max=10.0)
+            hs.append(h)
+        return torch.stack(hs, dim=1)
+
+    # Parallel scan via divide-and-conquer
+    # Pad to power of 2
+    L_pad = 1 << (L - 1).bit_length()
+    if L_pad > L:
+        pad_a = torch.ones(B, L_pad - L, D, N, device=dA.device, dtype=dA.dtype)
+        pad_b = torch.zeros(B, L_pad - L, D, N, device=dA.device, dtype=dA.dtype)
+        dA = torch.cat([dA, pad_a], dim=1)
+        dB_x = torch.cat([dB_x, pad_b], dim=1)
+
+    # Blelloch-style parallel prefix scan
+    # Up-sweep
+    a_vals = dA.clone()
+    b_vals = dB_x.clone()
+
+    steps = int(math.log2(L_pad))
+    for d in range(steps):
+        stride = 1 << (d + 1)
+        idx = torch.arange(stride - 1, L_pad, stride, device=dA.device)
+        prev_idx = idx - (stride // 2)
+
+        b_vals[:, idx] = a_vals[:, idx] * b_vals[:, prev_idx] + b_vals[:, idx]
+        a_vals[:, idx] = a_vals[:, idx] * a_vals[:, prev_idx]
+
+    # Down-sweep
+    for d in range(steps - 2, -1, -1):
+        stride = 1 << (d + 1)
+        idx = torch.arange(stride + (stride // 2) - 1, L_pad, stride, device=dA.device)
+        prev_idx = idx - (stride // 2)
+
+        if len(idx) > 0:
+            b_vals[:, idx] = a_vals[:, idx] * b_vals[:, prev_idx] + b_vals[:, idx]
+            a_vals[:, idx] = a_vals[:, idx] * a_vals[:, prev_idx]
+
+    return b_vals[:, :L]
+
+
 class MambaBlock(nn.Module):
-    """Mamba-1: Selective State Space Model with sequential scan."""
+    """Mamba-1: Selective State Space Model with parallel scan."""
     def __init__(self, d_model, d_state=16, d_conv=4, expand=2, dropout=0.1):
         super().__init__()
         self.d_model = d_model
@@ -20,6 +74,7 @@ class MambaBlock(nn.Module):
         self.in_proj = nn.Linear(d_model, self.d_inner * 2, bias=False)
         self.conv1d = nn.Conv1d(self.d_inner, self.d_inner, kernel_size=d_conv,
                                 groups=self.d_inner, padding=d_conv - 1, bias=True)
+        self.pre_ssm_norm = nn.LayerNorm(self.d_inner)
         self.x_proj = nn.Linear(self.d_inner, 2 * d_state + 1, bias=False)
 
         A = torch.arange(1, d_state + 1, dtype=torch.float32).repeat(self.d_inner, 1)
@@ -35,29 +90,30 @@ class MambaBlock(nn.Module):
 
     def ssm(self, x):
         B, L, D = x.shape
-        x_proj = self.x_proj(x)
+        # Normalize before projection to prevent unbounded growth
+        x_normed = self.pre_ssm_norm(x)
+        x_proj = self.x_proj(x_normed)
         delta = F.softplus(self.dt_proj(x_proj[:, :, 0:1]))
-        delta = torch.clamp(delta, min=1e-4, max=0.1)
-        B_ssm = x_proj[:, :, 1:1+self.d_state]
-        C_ssm = x_proj[:, :, 1+self.d_state:]
+        delta = torch.clamp(delta, min=1e-4, max=0.05)
+        B_ssm = torch.tanh(x_proj[:, :, 1:1+self.d_state])
+        C_ssm = torch.tanh(x_proj[:, :, 1+self.d_state:])
 
         A = -torch.exp(self.A_log)
-        A = torch.clamp(A, min=-10.0, max=-0.001)
+        A = torch.clamp(A, min=-5.0, max=-0.01)
+
+        # Compute discretized matrices
         dA = torch.exp(delta.unsqueeze(-1) * A.view(1, 1, self.d_inner, self.d_state))
-        dB = delta.unsqueeze(-1) * B_ssm.unsqueeze(2)
+        dB = delta.unsqueeze(-1) * B_ssm.unsqueeze(2)  # [B, L, D, N]
+        dB_x = dB * x.unsqueeze(-1)  # [B, L, D, N]
 
-        x_us = x.unsqueeze(-1)
-        h = torch.zeros(B, self.d_inner, self.d_state, device=x.device, dtype=x.dtype)
-        ys = []
+        # Parallel scan
+        h_all = parallel_scan(dA, dB_x)
 
-        for t in range(L):
-            h = dA[:, t] * h + dB[:, t] * x_us[:, t]
-            h = torch.clamp(h, min=-10.0, max=10.0)
-            y_t = torch.sum(h * C_ssm[:, t].unsqueeze(1), dim=-1)
-            ys.append(y_t)
+        # Output: y = C * h + D * x
+        y = torch.sum(h_all * C_ssm.unsqueeze(2), dim=-1)
+        h_last = h_all[:, -1]
 
-        y = torch.stack(ys, dim=1)
-        return y + x * self.D.view(1, 1, -1), h
+        return y + x * self.D.view(1, 1, -1), h_last
 
     def forward(self, x):
         B, L, D = x.shape
@@ -71,8 +127,7 @@ class MambaBlock(nn.Module):
 
 
 class Mamba2Block(nn.Module):
-    """Multi-head Mamba with per-head B/C/A projections.
-    Note: Requires CUDA for stable training beyond 25 epochs."""
+    """Multi-head Mamba with per-head B/C/A projections and parallel scan."""
     def __init__(self, d_model, d_state=16, d_conv=4, expand=2, n_heads=4, dropout=0.1):
         super().__init__()
         self.d_model = d_model
@@ -84,6 +139,7 @@ class Mamba2Block(nn.Module):
         self.in_proj = nn.Linear(d_model, self.d_inner * 2, bias=False)
         self.conv1d = nn.Conv1d(self.d_inner, self.d_inner, kernel_size=d_conv,
                                 groups=self.d_inner, padding=d_conv - 1, bias=True)
+        self.pre_ssm_norm = nn.LayerNorm(self.d_inner)
         self.x_proj = nn.Linear(self.d_inner, n_heads * (2 * d_state + 1), bias=False)
 
         A = torch.arange(1, d_state + 1, dtype=torch.float32).repeat(self.d_inner, 1)
@@ -99,33 +155,30 @@ class Mamba2Block(nn.Module):
 
     def ssm_multihead(self, x):
         B, L, D = x.shape
-        proj = self.x_proj(x).view(B, L, self.n_heads, 2 * self.d_state + 1)
+        x_normed = self.pre_ssm_norm(x)
+        proj = self.x_proj(x_normed).view(B, L, self.n_heads, 2 * self.d_state + 1)
         dt_raw = proj[:, :, :, 0]
         delta = F.softplus(self.dt_proj(dt_raw))
-        delta = torch.clamp(delta, min=1e-4, max=0.1)
-        B_ssm = proj[:, :, :, 1:1+self.d_state]
-        C_ssm = proj[:, :, :, 1+self.d_state:]
+        delta = torch.clamp(delta, min=1e-4, max=0.05)
+        B_ssm = torch.tanh(proj[:, :, :, 1:1+self.d_state])
+        C_ssm = torch.tanh(proj[:, :, :, 1+self.d_state:])
 
-        B_full = B_ssm.unsqueeze(3).expand(-1, -1, -1, self.head_dim, -1).reshape(B, L, self.d_inner, self.d_state)
-        C_full = C_ssm.unsqueeze(3).expand(-1, -1, -1, self.head_dim, -1).reshape(B, L, self.d_inner, self.d_state)
+        # Expand per-head to per-dim efficiently
+        B_full = B_ssm.repeat_interleave(self.head_dim, dim=2)
+        C_full = C_ssm.repeat_interleave(self.head_dim, dim=2)
 
         A = -torch.exp(self.A_log)
-        A = torch.clamp(A, min=-10.0, max=-0.001)
+        A = torch.clamp(A, min=-5.0, max=-0.01)
         dA = torch.exp(delta.unsqueeze(-1) * A.view(1, 1, self.d_inner, self.d_state))
-        dB = delta.unsqueeze(-1) * B_full
+        dB_x = (delta.unsqueeze(-1) * B_full) * x.unsqueeze(-1)
 
-        x_us = x.unsqueeze(-1)
-        h = torch.zeros(B, self.d_inner, self.d_state, device=x.device, dtype=x.dtype)
-        ys = []
+        # Parallel scan
+        h_all = parallel_scan(dA, dB_x)
 
-        for t in range(L):
-            h = dA[:, t] * h + dB[:, t] * x_us[:, t]
-            h = torch.clamp(h, min=-10.0, max=10.0)
-            y_t = torch.sum(h * C_full[:, t], dim=-1)
-            ys.append(y_t)
+        y = torch.sum(h_all * C_full, dim=-1)
+        h_last = h_all[:, -1]
 
-        y = torch.stack(ys, dim=1)
-        return y + x * self.D.view(1, 1, -1), h
+        return y + x * self.D.view(1, 1, -1), h_last
 
     def forward(self, x):
         B, L, D = x.shape
@@ -173,5 +226,4 @@ class MambaEncoder(nn.Module):
         return self.norm(x), states
 
 
-# Alias for clarity
 Mamba2Encoder = MambaEncoder

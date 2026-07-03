@@ -94,6 +94,10 @@ def main():
             model.load_state_dict(torch.load(ckpt_path, map_location=device))
             print(f"Loaded checkpoint: {ckpt_path}")
 
+        print("Calibrating on training data...")
+        trainer.calibrate(train_loader)
+        print(f"Train error stats — q50: {trainer.train_q50.mean():.6f}, iqr: {trainer.train_iqr.mean():.6f}")
+
         scores = trainer.test(test_loader)
         print(f"Anomaly scores shape: {scores.shape}")
         print(f"Score range: [{scores.min():.6f}, {scores.max():.6f}]")

@@ -8,12 +8,16 @@ import torch.nn.functional as F
 
 
 class TemporalGraphAttention(nn.Module):
-    """Multi-hop graph attention with time-pooled adjacency.
+    """Multi-hop graph attention with attention-pooled node features.
     Learns inter-variable relationships for multivariate anomaly detection."""
     def __init__(self, d_model, n_hops=2, dropout=0.1):
         super().__init__()
         self.d_model = d_model
         self.n_hops = n_hops
+
+        # Attention-based pooling over time dimension (scale-aware)
+        self.pool_query = nn.Parameter(torch.randn(1, 1, d_model) * 0.02)
+        self.pool_attn = nn.Linear(d_model, 1)
 
         self.edge_q = nn.Linear(d_model, d_model)
         self.edge_k = nn.Linear(d_model, d_model)
@@ -30,7 +34,7 @@ class TemporalGraphAttention(nn.Module):
 
     def forward(self, x, bs, c):
         """
-        x: [B*C, T, D] — channel-independent encoded features
+        x: [B*C, T, D] -- channel-independent encoded features
         bs: batch size
         c: number of channels
         Returns: [B*C, T, D]
@@ -38,8 +42,10 @@ class TemporalGraphAttention(nn.Module):
         _, T, D = x.shape
         x_4d = x.view(bs, c, T, D)
 
-        # Pool time to get node features
-        nodes = torch.mean(x_4d, dim=2)  # [BS, C, D]
+        # Attention-weighted pooling over time (respects scale structure)
+        attn_scores = self.pool_attn(x_4d).squeeze(-1)  # [BS, C, T]
+        attn_weights = F.softmax(attn_scores, dim=-1)  # [BS, C, T]
+        nodes = torch.einsum("bct,bctd->bcd", attn_weights, x_4d)  # [BS, C, D]
 
         # Compute adjacency
         Q = self.edge_q(nodes)
