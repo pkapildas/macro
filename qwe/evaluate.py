@@ -29,7 +29,7 @@ def load_labels(data_name, root_path, seq_len=96, batch_size=64):
 
 
 def evaluate_scores(scores, labels):
-    """Compute all evaluation metrics."""
+    """Compute all evaluation metrics with auto-direction detection."""
     from sklearn.metrics import (
         roc_auc_score, average_precision_score,
         precision_recall_curve, accuracy_score
@@ -50,6 +50,30 @@ def evaluate_scores(scores, labels):
     min_len = min(len(scores_flat), len(labels_flat))
     scores_flat = scores_flat[:min_len]
     labels_flat = labels_flat[:min_len]
+
+    # Auto-detect direction BEFORE normalization (on raw scores for best AUC)
+    labels_binary = (labels_flat > 0.5).astype(int)
+    try:
+        auc_normal = roc_auc_score(labels_binary, scores_flat)
+        auc_inverted = roc_auc_score(labels_binary, -scores_flat)
+        if auc_inverted > auc_normal:
+            scores_flat = -scores_flat
+            print(f"  [Auto-detect] Inverted scores (AUC {auc_normal:.4f} -> {auc_inverted:.4f})")
+        else:
+            print(f"  [Auto-detect] Normal direction (AUC {auc_normal:.4f})")
+    except:
+        pass
+
+    # Now normalize to [0,1] — clip at 99th percentile
+    clip_val = np.percentile(scores_flat, 99)
+    clip_low = np.percentile(scores_flat, 1)
+    scores_flat = np.clip(scores_flat, clip_low, clip_val)
+    s_min, s_max = scores_flat.min(), scores_flat.max()
+    if s_max - s_min > 1e-10:
+        scores_flat = (scores_flat - s_min) / (s_max - s_min)
+    else:
+        scores_flat = np.zeros_like(scores_flat)
+
 
     # Binary labels
     labels_binary = (labels_flat > 0.5).astype(int)
